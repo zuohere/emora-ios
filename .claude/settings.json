@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git remote add origin https://github.com/zuohere/emora-ios.git)",
+      "Bash(git push -u origin)",
+      "Bash(git push --set-upstream origin main)",
+      "Bash(git push --force-with-lease)",
+      "Bash(xcodebuild -project emora-ios.xcodeproj -scheme emora-ios -configuration Debug -destination 'generic/platform=iOS Simulator' build)"
+    ]
+  }
+}
