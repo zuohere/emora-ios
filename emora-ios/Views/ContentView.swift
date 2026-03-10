@@ -24,13 +24,22 @@ struct ContentView: View {
                 } else {
                     // Main content
                     VStack(spacing: 0) {
-                        // Camera preview (takes most of the screen)
-                        CameraPreviewContainer(videoManager: VideoCaptureManager.shared)
-                            .frame(height: geometry.size.height * 0.55)
+                        // Camera preview area with emotion overlay
+                        ZStack(alignment: .topTrailing) {
+                            // Camera preview
+                            CameraPreviewContainer(videoManager: VideoCaptureManager.shared)
+                                .frame(height: geometry.size.height * 0.55)
 
-                        // Control area
+                            // Emotion visualization overlay (top right, gray transparent)
+                            EmotionVisualizationContainer(viewModel: viewModel)
+                                .frame(width: 180, height: 200)
+                                .padding(.trailing, 16)
+                                .padding(.top, 8)
+                        }
+
+                        // Control area - only response panel now
                         VStack(spacing: 16) {
-                            // Response panel
+                            // Response panel (full width, text history)
                             ResponsePanel(viewModel: viewModel)
                                 .padding(.horizontal, 16)
 
@@ -157,4 +166,149 @@ struct LoadingView: View {
 
 #Preview {
     ContentView()
+}
+
+// MARK: - Emotion Visualization Container (Top Right Overlay)
+
+struct EmotionVisualizationContainer: View {
+    @ObservedObject var viewModel: EmoraViewModel
+
+    private let surfaceColor = Color(hex: "1F2937")
+    private let overlayColor = Color.black.opacity(0.6)
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack {
+                Text("Emotion")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.9))
+
+                Spacer()
+
+                // Status indicator
+                if latestEmotionResult != nil {
+                    Circle()
+                        .fill(Color.green)
+                        .frame(width: 6, height: 6)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Color.black.opacity(0.4))
+
+            // Visualization content
+            if let result = latestEmotionResult {
+                ScrollView {
+                    CompactEmotionView(result: result)
+                        .padding(8)
+                }
+            } else {
+                // Empty state
+                VStack(spacing: 8) {
+                    Image(systemName: "waveform.path.ecg")
+                        .font(.system(size: 24))
+                        .foregroundColor(Color.white.opacity(0.4))
+
+                    Text("Waiting...")
+                        .font(.system(size: 12))
+                        .foregroundColor(Color.white.opacity(0.4))
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(overlayColor)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.white.opacity(0.1), lineWidth: 1)
+        )
+    }
+
+    private var latestEmotionResult: EmotionAnalysisResult? {
+        for response in viewModel.responses.reversed() {
+            if let result = EmotionAnalysisResult.parse(from: response) {
+                return result
+            }
+        }
+        return nil
+    }
+}
+
+// MARK: - Compact Emotion View (for overlay)
+
+struct CompactEmotionView: View {
+    let result: EmotionAnalysisResult
+
+    private var dominant: (name: String, value: Double, color: String) {
+        result.emotion.emotion.dominantEmotion
+    }
+
+    private var emotionNameCN: String {
+        switch dominant.name {
+        case "happy": return "开心"
+        case "surprised": return "惊讶"
+        case "angry": return "愤怒"
+        case "disgusted": return "厌恶"
+        case "sad": return "悲伤"
+        case "fearful": return "恐惧"
+        default: return "中性"
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            // Dominant emotion
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(Color(hex: dominant.color))
+                    .frame(width: 10, height: 10)
+
+                Text(emotionNameCN)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(.white)
+
+                Text("\(Int(dominant.value * 100))%")
+                    .font(.system(size: 12))
+                    .foregroundColor(Color.white.opacity(0.7))
+            }
+
+            // Emotion bars (compact)
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(result.emotion.emotion.sortedEmotions.prefix(4), id: \.name) { item in
+                    HStack(spacing: 6) {
+                        Text(emotionNameCNfor(name: item.name))
+                            .font(.system(size: 10))
+                            .foregroundColor(Color.white.opacity(0.6))
+                            .frame(width: 28, alignment: .leading)
+
+                        GeometryReader { geometry in
+                            RoundedRectangle(cornerRadius: 2)
+                                .fill(Color.white.opacity(0.2))
+                                .frame(height: 4)
+
+                            RoundedRectangle(cornerRadius: 2)
+                                .fill(Color(hex: item.color))
+                                .frame(width: geometry.size.width * item.value, height: 4)
+                        }
+                        .frame(height: 4)
+                    }
+                }
+            }
+        }
+    }
+
+    private func emotionNameCNfor(name: String) -> String {
+        switch name {
+        case "happy": return "开心"
+        case "surprised": return "惊讶"
+        case "angry": return "愤怒"
+        case "disgusted": return "厌恶"
+        case "sad": return "悲伤"
+        case "fearful": return "恐惧"
+        default: return "中性"
+        }
+    }
 }

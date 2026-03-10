@@ -83,15 +83,15 @@ struct ControlPanel: View {
 // MARK: - Connection Status Badge
 
 struct ConnectionStatusBadge: View {
-    let state: ConnectionState
+    let state: AppConnectionState
 
     private var statusColor: Color {
         switch state {
-        case .connected:
+        case .appReady, .streaming:
             return Color(hex: "10B981")
-        case .connecting, .reconnecting:
+        case .transportConnected, .triggered, .connecting:
             return Color(hex: "F59E0B")
-        case .disconnected:
+        case .disconnected, .closing:
             return Color(hex: "9CA3AF")
         case .failed:
             return Color(hex: "EF4444")

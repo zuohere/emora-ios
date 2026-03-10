@@ -1,13 +1,21 @@
 import Foundation
 import Combine
 
-// MARK: - Connection State
+// MARK: - App Connection State (Refined State Machine)
 
-enum ConnectionState: Equatable {
+enum AppConnectionState: Equatable {
+    // Transport layer states
     case disconnected
     case connecting
-    case connected
-    case reconnecting(attempt: Int)
+    case transportConnected    // WebSocket handshake done, but app layer not ready
+    case appReady              // Application layer acknowledged, can send media
+
+    // Application states
+    case streaming             // Actively streaming video/audio/vital
+    case triggered            // Sent text, waiting for chunk/final response
+    case closing               // Graceful shutdown in progress
+
+    // Error state
     case failed(String)
 
     var displayText: String {
@@ -16,31 +24,49 @@ enum ConnectionState: Equatable {
             return "Disconnected"
         case .connecting:
             return "Connecting..."
-        case .connected:
-            return "Connected"
-        case .reconnecting(let attempt):
-            return "Reconnecting (\(attempt)/5)..."
+        case .transportConnected:
+            return "Transport Ready"
+        case .appReady:
+            return "Ready"
+        case .streaming:
+            return "Streaming"
+        case .triggered:
+            return "Waiting Response"
+        case .closing:
+            return "Closing..."
         case .failed(let error):
             return "Failed: \(error)"
         }
     }
 
-    var isConnected: Bool {
-        if case .connected = self {
+    var canSendMedia: Bool {
+        switch self {
+        case .transportConnected, .appReady, .streaming, .triggered:
             return true
+        default:
+            return false
         }
-        return false
+    }
+
+    var isActive: Bool {
+        switch self {
+        case .transportConnected, .appReady, .streaming, .triggered:
+            return true
+        default:
+            return false
+        }
     }
 }
 
 // MARK: - WebSocket Manager
 
-class WebSocketManager: NSObject, ObservableObject {
+class WebSocketManager: NSObject, ObservableObject, URLSessionDelegate, URLSessionWebSocketDelegate {
     // MARK: - Published Properties
 
-    @Published private(set) var connectionState: ConnectionState = .disconnected
+    @Published private(set) var connectionState: AppConnectionState = .disconnected
     @Published private(set) var lastResponse: String = ""
     @Published private(set) var responses: [String] = []
+    @Published private(set) var queueStats = StreamQueueStats()
 
     // MARK: - Properties
 
@@ -53,12 +79,27 @@ class WebSocketManager: NSObject, ObservableObject {
     private let heartbeatInterval: TimeInterval = 30
 
     // Flag to track if we've received server acknowledgment
-    private var hasReceivedAck = false
     private var isUserDisconnected = false
-    private let wsURL = "wss://api.finnox.cn/gateway/v1/proxy/ws?token=25942d659fd81c3a4faa8deae5d3e278.CwjYQzIEqF1uHX0f7EG9CiBfZN14qRimke4lixE9dzw" // Update with your backend URL
 
-    // Callback for sending video/audio data
+    // Stream queue manager
+    private let streamQueue = StreamQueueManager.shared
+
+    // Token (from AppConfig - should use secure storage in production)
+    private var authToken: String = AppConfig.authToken
+
+    // Current request tracking
+    private var currentRequestId: String?
+
+    // Message deduplication
+    private var seenMessageHashes = Set<String>()
+    private let seenMessagesLock = NSLock()
+    private let maxSeenMessages = 500
+
+    // Callbacks
     var onConnected: (() -> Void)?
+    var onAppReady: (() -> Void)?
+    var onStreamingStarted: (() -> Void)?
+    var onTriggered: ((String) -> Void)?  // request_id
 
     // MARK: - Singleton
 
@@ -66,25 +107,36 @@ class WebSocketManager: NSObject, ObservableObject {
 
     private override init() {
         super.init()
+        setupStreamQueue()
+    }
+
+    // MARK: - Configuration
+
+    /// Get WebSocket URL with token
+    private var wsURL: String {
+        // Use AppConfig for configuration
+        let baseURL = AppConfig.webSocketBaseURL
+        if !authToken.isEmpty {
+            return "\(baseURL)?token=\(authToken)"
+        }
+        return baseURL
     }
 
     // MARK: - Public Methods
 
     func connect() {
-        guard connectionState != .connected && connectionState != .connecting else {
-            // print("[WebSocket] Already connected or connecting, skipping...")
+        guard connectionState != .appReady && connectionState != .transportConnected &&
+              connectionState != .connecting else {
             return
         }
 
-        // Clean up existing connection without marking as user-initiated disconnect
+        // Clean up existing connection
         cleanupConnection()
-        isUserDisconnected = false  // Reset flag for new connection
+        isUserDisconnected = false
         connectionState = .connecting
-        // print("[WebSocket] Connecting to \(wsURL)...")
 
-        guard let url = URL(string: wsURL)else {
+        guard let url = URL(string: wsURL) else {
             connectionState = .failed("Invalid URL")
-            // print("[WebSocket] FAILED - Invalid URL")
             return
         }
 
@@ -94,21 +146,26 @@ class WebSocketManager: NSObject, ObservableObject {
         urlSession = URLSession(configuration: configuration, delegate: self, delegateQueue: .main)
         webSocketTask = urlSession?.webSocketTask(with: url)
         webSocketTask?.resume()
-        // print("[WebSocket] WebSocket task started, waiting for connection...")
 
         // Start receiving messages
         receiveMessage()
     }
 
     func disconnect() {
-        // print("[WebSocket] Disconnecting...")
-        isUserDisconnected = true  // Mark as user-initiated disconnect
+        isUserDisconnected = true
+        connectionState = .closing
+
+        // Stop streaming first
+        stopStreaming()
+
+        // Stop queue sender
+        streamQueue.stopSender()
+
+        // Clean up connection
         cleanupConnection()
-        // print("[WebSocket] Disconnected")
+        connectionState = .disconnected
     }
 
-    /// Clean up existing connection without marking as user-initiated disconnect
-    /// Used internally when reconnecting
     private func cleanupConnection() {
         stopHeartbeat()
         reconnectTimer?.invalidate()
@@ -117,41 +174,82 @@ class WebSocketManager: NSObject, ObservableObject {
         webSocketTask = nil
         urlSession?.invalidateAndCancel()
         urlSession = nil
-        connectionState = .disconnected
         reconnectAttempt = 0
-        hasReceivedAck = false
+        currentRequestId = nil
     }
 
-    // MARK: - Send Methods
+    // MARK: - Streaming Control
+
+    func startStreaming() {
+        guard connectionState.canSendMedia else {
+            print("[WebSocket] Cannot start streaming - state: \(connectionState)")
+            return
+        }
+
+        connectionState = .streaming
+        streamQueue.startSender()
+        onStreamingStarted?()
+    }
+
+    func stopStreaming() {
+        streamQueue.stopSender()
+        streamQueue.clearQueues()
+
+        if connectionState == .streaming || connectionState == .triggered {
+            connectionState = .appReady
+        }
+    }
+
+    // MARK: - Send Methods (Queue-based)
 
     func sendTextMessage() {
-        // Match client.py format exactly
+        guard connectionState.canSendMedia else {
+            print("[WebSocket] Cannot send text - not ready, state: \(connectionState)")
+            return
+        }
+
+        // Generate request_id (for tracking locally, NOT sent to backend)
+        let requestId = UUID().uuidString
+        currentRequestId = requestId
+
+        print("========== [WebSocket] sendTextMessage TRIGGERED ==========")
+        print("[WebSocket] request_id (local only): \(requestId)")
+
         let prepData: [String: Any] = [
             "user_prompt": [
                 "scene": "交谈场景",
-                "intention": "请综合语音、表情和生命体征，判断用户当前压力与情绪状态。交谈场景，请综合语音、表情和生命体征，判断用户当前压力与情绪状态。",
+                "intention": "请综合语音、表情和生命体征，判断用户当前压力与情绪状态。",
                 "analysis": "输出结构化结果，包含情绪标签、强度，以及是否需要干预的建议。"
             ]
         ]
 
-        // Match client.py format - no top-level user_prompt
+        // Match client.py format EXACTLY - NO request_id field!
         let payload: [String: Any] = [
             "user_id": "11",
             "messages": [
-                ["role": "user", "content": "你好，这是本地多模态情绪分析测试。"]
+                ["role": "user", "content": "你好"]
             ],
             "prep_data": prepData,
-            "snapshot_window_sec": 15.0,
+            "snapshot_window_sec": 15,
             "is_last": false
         ]
 
+        print("[WebSocket] Payload keys: \(payload.keys.sorted())")
+
         sendMessage(messageType: "text", payload: payload)
+
+        // Transition to triggered state
+        connectionState = .triggered
+        onTriggered?(requestId)
     }
 
     func sendVideoFrame(data: Data, timestamp: String, frameIndex: Int, width: Int, height: Int) {
-        //print("[WebSocket] sendVideoFrame: frameIndex=\(frameIndex), size=\(data.count)")
+        guard connectionState.canSendMedia else {
+            return  // Silently drop - don't flood logs
+        }
+
+        // Check queue capacity before encoding
         let base64Data = data.base64EncodedString()
-        // Note: client.py does NOT include user_id in video payload
         let payload: [String: Any] = [
             "timestamp": timestamp,
             "frame_index": frameIndex,
@@ -162,12 +260,29 @@ class WebSocketManager: NSObject, ObservableObject {
             "size": data.count
         ]
 
-        sendMessage(messageType: "video", payload: payload)
+        // Create message and enqueue
+        guard let jsonString = serializeToJSON(payload) else {
+            return
+        }
+
+        let message = StreamMessage(
+            type: .video,
+            payload: jsonString.data(using: .utf8)!,
+            metadata: [
+                "messageType": "video",
+                "frameIndex": frameIndex
+            ]
+        )
+
+        _ = streamQueue.enqueueVideo(message)
     }
 
     func sendAudioChunk(data: Data, timestamp: String, chunkIndex: Int, sampleRate: Int, channels: Int) {
+        guard connectionState.canSendMedia else {
+            return  // Silently drop
+        }
+
         let base64Data = data.base64EncodedString()
-        // Note: client.py does NOT include user_id in audio payload
         let payload: [String: Any] = [
             "timestamp": timestamp,
             "chunk_index": chunkIndex,
@@ -178,12 +293,28 @@ class WebSocketManager: NSObject, ObservableObject {
             "size": data.count
         ]
 
-        sendMessage(messageType: "audio", payload: payload)
+        guard let jsonString = serializeToJSON(payload) else {
+            return
+        }
+
+        let message = StreamMessage(
+            type: .audio,
+            payload: jsonString.data(using: .utf8)!,
+            metadata: [
+                "messageType": "audio",
+                "chunkIndex": chunkIndex
+            ]
+        )
+
+        _ = streamQueue.enqueueAudio(message)
     }
 
     func sendVitalData(heartRate: Double, breathRate: Double, breathAmp: Double, conf: Double) {
+        guard connectionState.canSendMedia else {
+            return  // Silently drop
+        }
+
         let timestamp = ISO8601DateFormatter().string(from: Date())
-        // Note: client.py does NOT include user_id in vital payload
         let payload: [String: Any] = [
             "timestamp": timestamp,
             "heart_rate": heartRate,
@@ -194,29 +325,90 @@ class WebSocketManager: NSObject, ObservableObject {
             "presence_status": 1
         ]
 
-        sendMessage(messageType: "vital", payload: payload)
+        guard let jsonString = serializeToJSON(payload) else {
+            return
+        }
+
+        let message = StreamMessage(
+            type: .vital,
+            payload: jsonString.data(using: .utf8)!,
+            metadata: ["messageType": "vital"]
+        )
+
+        _ = streamQueue.enqueueVital(message)
     }
 
     // MARK: - Private Methods
 
+    /// Safely serialize dictionary to JSON string, filtering out unsupported types
+    /// Handles nested dictionaries and arrays recursively
+    private func serializeToJSON(_ dict: [String: Any]) -> String? {
+        let safeDict = filterSerializable(dict)
+
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: safeDict),
+              let jsonString = String(data: jsonData, encoding: .utf8) else {
+            return nil
+        }
+        return jsonString
+    }
+
+    /// Recursively filter dictionary to only include serializable types
+    private func filterSerializable(_ value: Any) -> Any {
+        if let stringValue = value as? String {
+            return stringValue
+        } else if let intValue = value as? Int {
+            return intValue
+        } else if let doubleValue = value as? Double {
+            return doubleValue
+        } else if let boolValue = value as? Bool {
+            return boolValue
+        } else if value is NSNull {
+            return NSNull()
+        } else if let dict = value as? [String: Any] {
+            // Recursively filter dictionary
+            var safeDict: [String: Any] = [:]
+            for (key, val) in dict {
+                safeDict[key] = filterSerializable(val)
+            }
+            return safeDict
+        } else if let array = value as? [Any] {
+            // Recursively filter array
+            return array.map { filterSerializable($0) }
+        }
+        // Skip Data, Date, and other unsupported types
+        return NSNull()
+    }
+
+    private func setupStreamQueue() {
+        // Configure queue from AppConfig
+        var config = StreamQueueManager.Config()
+        config.maxVideoQueueSize = AppConfig.Queue.maxVideoQueueSize
+        config.maxAudioQueueSize = AppConfig.Queue.maxAudioQueueSize
+        config.maxVitalQueueSize = AppConfig.Queue.maxVitalQueueSize
+        config.sendIntervalMs = AppConfig.Queue.sendIntervalMs
+        config.dropAudioWhenFull = AppConfig.Queue.dropAudioWhenFull
+        streamQueue.configure(config)
+
+        streamQueue.onSendMessage = { [weak self] message in
+            self?.sendStreamMessage(message)
+        }
+
+        // Update queue stats periodically
+        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.queueStats = self?.streamQueue.stats ?? StreamQueueStats()
+        }
+    }
+
     private func sendMessage(messageType: String, payload: Any) {
         guard let webSocketTask = webSocketTask else {
-            //print("[WebSocket] Send FAILED - No WebSocket task, messageType: \(messageType)")
+            streamQueue.recordSendError("No WebSocket task")
             return
         }
 
         // Check task state
-        switch webSocketTask.state {
-        case .running:
-            break  // OK
-        case .canceling:
-            // print("[WebSocket] Send FAILED - Task is canceling, messageType: \(messageType)")
+        guard webSocketTask.state == .running else {
+            streamQueue.recordSendError("Task not running: \(webSocketTask.state.rawValue)")
             return
-        case .completed:
-            // print("[WebSocket] Send FAILED - Task is completed, messageType: \(messageType)")
-            return
-        @unknown default:
-            break
         }
 
         let message: [String: Any] = [
@@ -224,33 +416,71 @@ class WebSocketManager: NSObject, ObservableObject {
             "payload": payload
         ]
 
-        do {
-            let jsonData = try JSONSerialization.data(withJSONObject: message)
-            let messageSize = jsonData.count
+        guard let jsonString = serializeToJSON(message) else {
+            return
+        }
 
-            // Debug: Print exact JSON being sent
-            if let jsonString = String(data: jsonData, encoding: .utf8) {
-                // print("\n========== [SENDING \(messageType.uppercased()) MESSAGE] ==========")
-                // Pretty print for readability
-                // if let prettyData = try? JSONSerialization.data(withJSONObject: message, options: [.prettyPrinted, .withoutEscapingSlashes]),
-                //    let prettyString = String(data: prettyData, encoding: .utf8) {
-                //     print(prettyString)
-                // } else {
-                //     print(jsonString)
-                // }
-                // print("===========================================================\n")
+        // Print detailed info for text messages
+        if messageType == "text" {
+            print("[WebSocket] ====== TEXT MESSAGE BEING SENT ======")
+            print("[WebSocket] Full JSON: \(jsonString)")
+        } else {
+            print("[WebSocket] Sending message_type: \(messageType)")
+        }
 
-                let wsMessage = URLSessionWebSocketTask.Message.string(jsonString)
-                webSocketTask.send(wsMessage) { [weak self] error in
-                    if let error = error {
-                        // print("[WebSocket] Send FAILED - messageType: \(messageType), error: \(error.localizedDescription)")
-                    } else {
-                        // print("[WebSocket] Send SUCCESS - messageType: \(messageType), size: \(messageSize) bytes")
-                    }
-                }
+        let wsMessage = URLSessionWebSocketTask.Message.string(jsonString)
+        webSocketTask.send(wsMessage) { [weak self] error in
+            if let error = error {
+                self?.streamQueue.recordSendError(error.localizedDescription)
             }
-        } catch {
-            // print("[WebSocket] Send FAILED - encode error: \(error.localizedDescription)")
+        }
+    }
+
+    private func sendStreamMessage(_ streamMessage: StreamMessage) {
+        let messageType = streamMessage.metadata["messageType"] as? String ?? "unknown"
+
+        guard let webSocketTask = webSocketTask else {
+            streamQueue.recordSendError("No WebSocket task")
+            return
+        }
+
+        guard webSocketTask.state == .running else {
+            streamQueue.recordSendError("Task not running: \(webSocketTask.state.rawValue)")
+            return
+        }
+
+        // Convert JSON payload Data back to string (it was stored as JSON string)
+        guard let payloadString = String(data: streamMessage.payload, encoding: .utf8) else {
+            streamQueue.recordSendError("Failed to decode payload")
+            return
+        }
+
+        // Parse the JSON string back to object
+        guard let payloadData = payloadString.data(using: .utf8),
+              let payloadJson = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any] else {
+            streamQueue.recordSendError("Failed to parse payload JSON")
+            return
+        }
+
+        // Build wrapper - payload should be JSON object, NOT base64 string (matching client.py)
+        let wrapper: [String: Any] = [
+            "message_type": messageType,
+            "payload": payloadJson
+        ]
+
+        guard let jsonString = serializeToJSON(wrapper) else {
+            return
+        }
+
+        if messageType == "video" || messageType == "audio" || messageType == "vital" {
+            print("[WebSocket] \(messageType) payload (no double base64): \(payloadString.prefix(100))...")
+        }
+
+        let wsMessage = URLSessionWebSocketTask.Message.string(jsonString)
+        webSocketTask.send(wsMessage) { [weak self] error in
+            if let error = error {
+                self?.streamQueue.recordSendError(error.localizedDescription)
+            }
         }
     }
 
@@ -273,86 +503,107 @@ class WebSocketManager: NSObject, ObservableObject {
             @unknown default:
                 break
             }
-            // Continue receiving
-            if connectionState.isConnected {
+
+            // Continue receiving if still connected
+            if connectionState.isActive {
                 receiveMessage()
             }
 
         case .failure(let error):
-            // print("[WebSocket] Receive error: \(error)")
             handleDisconnection(error: error)
         }
     }
 
+    // Background queue for message processing
+    private let processingQueue = DispatchQueue(label: "com.emora.messageProcessing", qos: .userInitiated)
+
     private func handleTextMessage(_ string: String) {
+        // Deduplication: check if we've seen this message
+        let messageHash = String(string.hashValue)
+        var shouldSkip = false
+
+        seenMessagesLock.lock()
+        if seenMessageHashes.contains(messageHash) {
+            shouldSkip = true
+        } else {
+            if seenMessageHashes.count >= maxSeenMessages {
+                seenMessageHashes.removeFirst()
+            }
+            seenMessageHashes.insert(messageHash)
+        }
+        seenMessagesLock.unlock()
+
+        if shouldSkip {
+            return
+        }
+
+        // Store raw response immediately for UI
         lastResponse = string
-        responses.append(string)
 
-        // Parse JSON
-        if let data = string.data(using: .utf8),
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        // Move heavy processing to background queue
+        processingQueue.async { [weak self] in
+            guard let self = self else { return }
 
-            // Extract message type first
-            let messageType = json["message_type"] as? String ?? ""
+            // Append response in background
+            self.responses.append(string)
 
-            // Only print for text response (chunk message)
-            if messageType == "chunk" {
-                print("\n==================================================")
-                print("📥 [服务器返回的文本分析结果]")
-                print("==================================================")
-
-                if let prettyData = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .withoutEscapingSlashes]),
-                   let prettyString = String(data: prettyData, encoding: .utf8) {
-                    print(prettyString)
-                } else {
-                    print(string)
-                }
-                print("==================================================\n")
+            // Parse JSON in background
+            guard let data = string.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return
             }
 
-            // Extract key info (not printed)
+            let messageType = json["message_type"] as? String ?? ""
             let payload = json["payload"] as? [String: Any]
             let isFinal = json["is_final"] as? Bool ?? false
-            let seq = json["seq"] as? Int ?? 0
             let requestId = json["request_id"] as? String ?? ""
 
-            if messageType == "chunk", let payload = payload {
-                if let delta = payload["delta"] as? String {
-                    // unused
-                }
-                if isFinal, let emotionResult = payload["emotion_result"] as? [String: Any] {
-                    if let emotion = emotionResult["emotion"] as? [String: Any],
-                       let analysis = emotionResult["analysis"] as? String {
-                        // unused
+            // Handle state changes on main thread
+            DispatchQueue.main.async {
+                switch messageType {
+                case "ack":
+                    if self.connectionState == .transportConnected {
+                        self.connectionState = .appReady
+                        self.onAppReady?()
                     }
-                }
-            } else if messageType == "ack" {
-                // unused
-            } else if messageType == "pong" {
-                // unused
-            } else if messageType == "error" {
-                let code = json["code"] as? Int ?? 0
-                let msg = json["msg"] as? String ?? ""
-                // unused
-            }
-        } else {
-            // Not JSON, print as is
-            print(string)
-        }
-    
 
-        // Keep only last 100 responses
-        if responses.count > 100 {
-            responses.removeFirst()
+                case "chunk":
+                    if isFinal {
+                        if self.connectionState == .triggered {
+                            self.connectionState = .streaming
+                        }
+                    }
+
+                case "final":
+                    if self.connectionState == .triggered {
+                        self.connectionState = .streaming
+                    }
+
+                case "error":
+                    let code = json["code"] as? Int ?? 0
+                    let msg = json["msg"] as? String ?? ""
+                    print("[WebSocket] Server error: code=\(code), msg=\(msg)")
+
+                default:
+                    break
+                }
+            }
+
+            // Keep only last 100 responses (in background)
+            if self.responses.count > 100 {
+                self.responses.removeFirst()
+            }
         }
     }
 
     private func handleDisconnection(error: Error?) {
-        let wasConnected = connectionState == .connected
+        let wasConnected = connectionState.isActive
         connectionState = .disconnected
         stopHeartbeat()
 
-        // print("[WebSocket] Disconnected - wasConnected: \(wasConnected), error: \(error?.localizedDescription ?? "nil"), userDisconnected: \(isUserDisconnected)")
+        // Stop streaming
+        streamQueue.stopSender()
+        streamQueue.clearQueues()
 
         // Only attempt reconnect if it wasn't a user-initiated disconnect
         if wasConnected && !isUserDisconnected {
@@ -363,7 +614,6 @@ class WebSocketManager: NSObject, ObservableObject {
     private func startHeartbeat() {
         stopHeartbeat()
         heartbeatTimer = Timer.scheduledTimer(withTimeInterval: heartbeatInterval, repeats: true) { [weak self] _ in
-            // print("[WebSocket] Sending application-layer ping...")
             self?.sendAppPing()
         }
     }
@@ -374,47 +624,36 @@ class WebSocketManager: NSObject, ObservableObject {
     }
 
     private func sendAppPing() {
-        // Send application-layer ping message (not WebSocket transport layer ping)
         let pingMessage: [String: Any] = [
             "message_type": "ping"
         ]
 
-        guard let jsonData = try? JSONSerialization.data(withJSONObject: pingMessage),
-              let jsonString = String(data: jsonData, encoding: .utf8) else {
+        guard let jsonString = serializeToJSON(pingMessage) else {
             return
         }
 
         webSocketTask?.send(.string(jsonString)) { [weak self] error in
             if let error = error {
-                // print("[WebSocket] Ping send FAILED: \(error.localizedDescription)")
+                print("[WebSocket] Ping failed: \(error.localizedDescription)")
                 self?.attemptReconnect()
-            } else {
-                // print("[WebSocket] Ping sent successfully")
             }
         }
     }
 
     private func attemptReconnect() {
-        // Don't reconnect if user explicitly disconnected
-        guard !isUserDisconnected else {
-            // print("[WebSocket] Skipping reconnect - user disconnected")
-            return
-        }
+        guard !isUserDisconnected else { return }
 
         guard reconnectAttempt < maxReconnectAttempts else {
             connectionState = .failed("Max reconnection attempts reached")
-            // print("[WebSocket] Max reconnection attempts reached")
             return
         }
 
         reconnectAttempt += 1
-        connectionState = .reconnecting(attempt: reconnectAttempt)
-        // print("[WebSocket] Reconnecting... attempt: \(reconnectAttempt)/\(maxReconnectAttempts)")
+        connectionState = .failed("Reconnecting (\(reconnectAttempt)/\(maxReconnectAttempts))...")
 
         // Exponential backoff: 1s, 2s, 4s, 8s, 16s
         let delay = pow(2.0, Double(reconnectAttempt - 1))
         reconnectTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
-            // Check again before reconnecting
             guard let self = self, !self.isUserDisconnected else {
                 return
             }
@@ -430,32 +669,25 @@ class WebSocketManager: NSObject, ObservableObject {
 
 // MARK: - URLSessionWebSocketDelegate
 
-extension WebSocketManager: URLSessionWebSocketDelegate {
+extension WebSocketManager {
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
-        // print("[WebSocket] Connection OPENED - Handshake successful!")
-        // Standard WebSocket: connection is ready when handshake completes
-        connectionState = .connected
-        hasReceivedAck = true  // Allow sending immediately after handshake
+        connectionState = .transportConnected
         reconnectAttempt = 0
         startHeartbeat()
         onConnected?()
     }
 
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
-        // print("[WebSocket] Connection CLOSED - closeCode: \(closeCode.rawValue)")
         connectionState = .disconnected
         stopHeartbeat()
-        hasReceivedAck = false
 
-        if closeCode != .normalClosure {
-            // print("[WebSocket] Abnormal closure, attempting reconnect...")
+        if closeCode != .normalClosure && !isUserDisconnected {
             attemptReconnect()
         }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         if let error = error {
-            // print("[WebSocket] Task completed with error: \(error.localizedDescription)")
             connectionState = .failed(error.localizedDescription)
             attemptReconnect()
         }

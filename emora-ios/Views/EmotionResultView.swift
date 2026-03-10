@@ -469,8 +469,9 @@ extension EmotionAnalysisResult {
         // Try to extract emotion_result from the payload
         if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let payload = json["payload"] as? [String: Any],
-           let emotionResult = payload["emotion_result"] {
+           let emotionResult = payload["emotion_result"] as? [String: Any] {
 
+            // Try to convert to Data and decode
             if let resultData = try? JSONSerialization.data(withJSONObject: emotionResult),
                let result = try? JSONDecoder().decode(EmotionAnalysisResult.self, from: resultData) {
                 return result

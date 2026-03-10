@@ -37,6 +37,9 @@ class VideoCaptureManager: NSObject, ObservableObject {
     // Callback for encoded frames
     var onVideoFrameEncoded: ((Data, String, Int, Int, Int) -> Void)?
 
+    // Callback for capture errors
+    var onCaptureError: ((Error) -> Void)?
+
     // Serial queue for session management
     private let sessionQueue = DispatchQueue(label: "com.emora.captureSession")
 
@@ -49,6 +52,55 @@ class VideoCaptureManager: NSObject, ObservableObject {
 
     private override init() {
         super.init()
+        setupNotifications()
+    }
+
+    // MARK: - Notification Handling
+
+    private func setupNotifications() {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleCaptureSessionRuntimeError),
+            name: .AVCaptureSessionRuntimeError,
+            object: nil
+        )
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleCaptureSessionWasInterrupted),
+            name: .AVCaptureSessionWasInterrupted,
+            object: nil
+        )
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleCaptureSessionInterruptionEnded),
+            name: .AVCaptureSessionInterruptionEnded,
+            object: nil
+        )
+    }
+
+    @objc private func handleCaptureSessionRuntimeError(_ notification: Notification) {
+        print("[VideoCapture] Runtime error: \(notification.description)")
+        onCaptureError?(VideoError.runtimeError)
+
+        // Try to restart session
+        sessionQueue.async { [weak self] in
+            guard let self = self, let session = self.captureSession else { return }
+            session.startRunning()
+        }
+    }
+
+    @objc private func handleCaptureSessionWasInterrupted(_ notification: Notification) {
+        print("[VideoCapture] Session interrupted")
+    }
+
+    @objc private func handleCaptureSessionInterruptionEnded(_ notification: Notification) {
+        print("[VideoCapture] Interruption ended, resuming...")
+        sessionQueue.async { [weak self] in
+            guard let self = self, let session = self.captureSession, self.isCapturing else { return }
+            session.startRunning()
+        }
     }
 
     // MARK: - Public Methods
@@ -105,6 +157,12 @@ class VideoCaptureManager: NSObject, ObservableObject {
             return
         }
 
+        // If already capturing, don't restart
+        guard !isCapturing else {
+            print("[VideoCapture] Already capturing, skipping start")
+            return
+        }
+
         // Reset SPS/PPS for new capture session
         spsData = nil
         ppsData = nil
@@ -119,9 +177,26 @@ class VideoCaptureManager: NSObject, ObservableObject {
         sessionQueue.async { [weak self] in
             guard let self = self else { return }
 
-            if !self.isSessionRunning {
-                session.startRunning()
-                self.isSessionRunning = session.isRunning
+            // Check if session can run
+            if session.isRunning {
+                print("[VideoCapture] Session already running")
+                self.isSessionRunning = true
+            } else {
+                // Begin configuration to ensure session is ready
+                session.beginConfiguration()
+                session.commitConfiguration()
+
+                do {
+                    try session.startRunning()
+                    self.isSessionRunning = session.isRunning
+                    print("[VideoCapture] Session started: \(self.isSessionRunning)")
+                } catch {
+                    print("[VideoCapture] Failed to start session: \(error)")
+                    DispatchQueue.main.async {
+                        self.onCaptureError?(VideoError.sessionFailed)
+                    }
+                    return
+                }
             }
 
             DispatchQueue.main.async {
@@ -466,6 +541,8 @@ enum VideoError: Error, LocalizedError {
     case cannotAddInput
     case cannotAddOutput
     case encodingFailed
+    case runtimeError
+    case sessionFailed
 
     var errorDescription: String? {
         switch self {
@@ -477,6 +554,10 @@ enum VideoError: Error, LocalizedError {
             return "Cannot add video output"
         case .encodingFailed:
             return "Video encoding failed"
+        case .runtimeError:
+            return "Camera runtime error"
+        case .sessionFailed:
+            return "Camera session failed to start"
         }
     }
 }

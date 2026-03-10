@@ -4,7 +4,6 @@ import SwiftUI
 
 struct ResponsePanel: View {
     @ObservedObject var viewModel: EmoraViewModel
-    @State private var isExpanded: Bool = false
 
     // Colors from SPEC
     private let surfaceColor = Color(hex: "1F2937")
@@ -13,13 +12,17 @@ struct ResponsePanel: View {
         VStack(spacing: 0) {
             // Header
             HStack {
-                Text("Analysis Response")
+                Text("History")
                     .font(.system(size: 16, weight: .semibold))
                     .foregroundColor(.white)
 
                 Spacer()
 
                 if !viewModel.responses.isEmpty {
+                    Text("\(viewModel.responses.count) messages")
+                        .font(.system(size: 12))
+                        .foregroundColor(Color(hex: "9CA3AF"))
+
                     Button(action: {
                         viewModel.clearResponses()
                     }) {
@@ -28,29 +31,43 @@ struct ResponsePanel: View {
                             .foregroundColor(Color(hex: "9CA3AF"))
                     }
                 }
-
-                Button(action: {
-                    withAnimation(.spring(response: 0.3)) {
-                        isExpanded.toggle()
-                    }
-                }) {
-                    Image(systemName: isExpanded ? "chevron.down" : "chevron.up")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundColor(Color(hex: "9CA3AF"))
-                }
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
             .background(surfaceColor)
 
-            // Content
-            if isExpanded {
+            // History content - always visible now
+            if viewModel.responses.isEmpty {
+                // Empty state
+                VStack(spacing: 8) {
+                    Image(systemName: "message")
+                        .font(.system(size: 24))
+                        .foregroundColor(Color(hex: "6B7280"))
+
+                    Text("No messages yet")
+                        .font(.system(size: 14))
+                        .foregroundColor(Color(hex: "6B7280"))
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .frame(height: 100)
+            } else {
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 8) {
                             ForEach(Array(viewModel.responses.enumerated()), id: \.offset) { index, response in
-                                ResponseItem(response: response)
+                                ResponseItem(response: response, isExpanded: expandedItems.contains(index))
                                     .id(index)
+                                    .highPriorityGesture(
+                                        TapGesture().onEnded {
+                                            withAnimation(.spring(response: 0.3)) {
+                                                if expandedItems.contains(index) {
+                                                    expandedItems.remove(index)
+                                                } else {
+                                                    expandedItems.insert(index)
+                                                }
+                                            }
+                                        }
+                                    )
                             }
                         }
                         .padding(16)
@@ -64,12 +81,7 @@ struct ResponsePanel: View {
                         }
                     }
                 }
-                .frame(height: 200)
-            }
-
-            // Latest response preview
-            if !isExpanded && !viewModel.latestResponse.isEmpty {
-                LatestResponsePreview(response: viewModel.latestResponse)
+                .frame(height: 100)
             }
         }
         .background(
@@ -81,12 +93,15 @@ struct ResponsePanel: View {
                 .stroke(Color.white.opacity(0.1), lineWidth: 1)
         )
     }
+
+    @State private var expandedItems: Set<Int> = []
 }
 
 // MARK: - Response Item
 
 struct ResponseItem: View {
     let response: String
+    var isExpanded: Bool = false
     @State private var parsedEmotionResult: EmotionAnalysisResult?
 
     var body: some View {
@@ -99,7 +114,7 @@ struct ResponseItem: View {
                 Spacer()
 
                 if parsedEmotionResult != nil {
-                    Text("Emotion Analysis")
+                    Text("Emotion")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundColor(Color(hex: "8B5CF6"))
                         .padding(.horizontal, 8)
@@ -109,17 +124,26 @@ struct ResponseItem: View {
                                 .fill(Color(hex: "8B5CF6").opacity(0.2))
                         )
                 }
+
+                // Expand indicator
+                Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                    .font(.system(size: 10))
+                    .foregroundColor(Color(hex: "6B7280"))
             }
 
             if let emotionResult = parsedEmotionResult {
-                // Show beautiful emotion result view
-                EmotionResultView(result: emotionResult)
+                // Show emotion result (compact when collapsed, full when expanded)
+                if isExpanded {
+                    EmotionResultView(result: emotionResult)
+                } else {
+                    CompactEmotionPreview(result: emotionResult)
+                }
             } else {
                 // Show regular text response
-                Text(formattedResponse)
+                Text(isExpanded ? fullResponse : truncatedResponse)
                     .font(.system(size: 13))
                     .foregroundColor(.white.opacity(0.9))
-                    .lineLimit(nil)
+                    .lineLimit(isExpanded ? nil : 2)
                     .multilineTextAlignment(.leading)
             }
         }
@@ -144,7 +168,33 @@ struct ResponseItem: View {
         parsedEmotionResult = EmotionAnalysisResult.parse(from: response)
     }
 
-    private var formattedResponse: String {
+    private var truncatedResponse: String {
+        // Try to format JSON response
+        guard let data = response.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let messageType = json["message_type"] as? String else {
+            return String(response.prefix(100))
+        }
+
+        switch messageType {
+        case "chunk":
+            if let payload = json["payload"] as? [String: Any] {
+                if let delta = payload["delta"] as? String {
+                    return String(delta.prefix(100))
+                }
+                if payload["emotion_result"] != nil {
+                    return "Emotion analysis result"
+                }
+            }
+            return "Chunk received"
+        case "ack":
+            return "Acknowledged"
+        default:
+            return String(response.prefix(100))
+        }
+    }
+
+    private var fullResponse: String {
         // Try to format JSON response
         guard let data = response.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -158,15 +208,36 @@ struct ResponseItem: View {
                 if let delta = payload["delta"] as? String {
                     return delta
                 }
-                if let emotionResult = payload["emotion_result"] {
-                    if let resultData = try? JSONSerialization.data(withJSONObject: emotionResult, options: .prettyPrinted),
-                       let resultString = String(data: resultData, encoding: .utf8) {
-                        return resultString
+                if let emotionResult = payload["emotion_result"] as? [String: Any] {
+                    // Manually format the emotion result instead of re-serializing
+                    if let emotion = emotionResult["emotion"] as? [String: Any],
+                       let emotionLabel = emotion["emotion_label"] as? String {
+                        return "Emotion: \(emotionLabel)"
                     }
+                    // Fallback: show as string
+                    return String(describing: emotionResult)
                 }
             }
             return "Chunk received"
         case "ack":
+            // Show full acknowledgment details
+            if let payload = json["payload"] as? [String: Any] {
+                var details: [String] = []
+                if let type = payload["type"] as? String {
+                    details.append("Type: \(type)")
+                }
+                if let message = payload["message"] as? String {
+                    details.append("Message: \(message)")
+                }
+                if let timestamp = payload["timestamp"] as? Double {
+                    let date = Date(timeIntervalSince1970: timestamp)
+                    let formatter = DateFormatter()
+                    formatter.dateStyle = .medium
+                    formatter.timeStyle = .medium
+                    details.append("Time: \(formatter.string(from: date))")
+                }
+                return details.isEmpty ? "Acknowledged" : details.joined(separator: "\n")
+            }
             return "Acknowledged"
         default:
             return response
